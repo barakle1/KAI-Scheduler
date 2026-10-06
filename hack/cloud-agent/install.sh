@@ -51,11 +51,14 @@ go mod download
 make envtest
 
 if ! docker image inspect "builder:1.26.8-bookworm" >/dev/null 2>&1; then
-  if ! DOCKER_BUILDKIT=1 docker build -f hack/cloud-agent/kai-builder.Dockerfile -t builder:1.26.8-bookworm .; then
-    if ! make builder; then
-      echo "Warning: could not build builder:1.26.8-bookworm (Docker Hub egress may be required for make build-go and make test)" >&2
-    fi
+  if ! DOCKER_BUILDKIT=1 docker build -f hack/cloud-agent/kai-builder.Dockerfile -t builder:1.26.8-bookworm . \
+    && ! make builder; then
+    :
+  elif ! docker image inspect "builder:1.26.8-bookworm" >/dev/null 2>&1; then
+    echo "Warning: builder:1.26.8-bookworm is missing (Docker Hub layer CDN egress required for make build-go and make test)" >&2
   fi
 fi
 
-make chart-deps
+if ! make chart-deps; then
+  echo "Warning: make chart-deps failed (ghcr.io egress required for Helm chart tests). Run 'make chart-deps' once egress is enabled." >&2
+fi
