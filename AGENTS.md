@@ -187,7 +187,7 @@ PRs trigger: `make validate` → `make test` → `make build` → E2E tests
 
 ## Cursor Cloud specific instructions
 
-Cloud Agent bootstrap is defined in `.cursor/environment.json` (`install` / `start` scripts).
+Cloud Agent bootstrap uses `hack/cloud-agent/install.sh` and `hack/cloud-agent/start.sh` (saved in the Cloud Agent environment panel as `install` / `start`).
 
 - **`start`** brings up the Docker daemon (`dockerd`) when it is not already running; `make build`, `make test`, and `make lint-go` expect Docker.
 - **`install`** runs `go mod download`, `make envtest`, builds the `builder:1.26.8-bookworm` image when Docker registry access is available, and `make chart-deps` (Helm OCI pull from `ghcr.io`).
