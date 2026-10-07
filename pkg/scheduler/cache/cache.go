@@ -31,6 +31,7 @@ import (
 	"go.uber.org/multierr"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/discovery"
@@ -61,6 +62,7 @@ import (
 	k8splugins "github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/k8s_internal/plugins"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/log"
 	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/metrics"
+	"github.com/kai-scheduler/KAI-scheduler/pkg/scheduler/utils"
 	kubeaischedulerver "github.com/kai-scheduler/api/client/clientset/versioned"
 	kubeaischedulerschema "github.com/kai-scheduler/api/client/clientset/versioned/scheme"
 	kubeaischedulerinfo "github.com/kai-scheduler/api/client/informers/externalversions"
@@ -112,6 +114,45 @@ func registerSchedulerPodInformer(informerFactory informers.SharedInformerFactor
 	})
 }
 
+func registerPodGroupEvictionMetricHandlers(
+	informer k8scache.SharedIndexInformer,
+	partitionSelector labels.Selector,
+	nodePoolLabelKey string,
+	evictionActionNames []string,
+) error {
+	_, err := informer.AddEventHandler(k8scache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			if podGroup, ok := obj.(*enginev2alpha2.PodGroup); ok {
+				metrics.InitPodGroupEvictionMetrics(podGroup, partitionSelector, nodePoolLabelKey, evictionActionNames)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			oldPodGroup, oldOK := oldObj.(*enginev2alpha2.PodGroup)
+			newPodGroup, newOK := newObj.(*enginev2alpha2.PodGroup)
+			if oldOK && newOK {
+				metrics.InitPodGroupEvictionMetricsOnUpdate(
+					oldPodGroup, newPodGroup, partitionSelector, nodePoolLabelKey, evictionActionNames,
+				)
+			}
+		},
+		DeleteFunc: func(obj interface{}) {
+			podGroup, ok := obj.(*enginev2alpha2.PodGroup)
+			if !ok {
+				tombstone, tombstoneOK := obj.(k8scache.DeletedFinalStateUnknown)
+				if !tombstoneOK {
+					return
+				}
+				podGroup, ok = tombstone.Obj.(*enginev2alpha2.PodGroup)
+				if !ok {
+					return
+				}
+			}
+			metrics.DeletePodGroupEvictionMetrics(podGroup, partitionSelector, nodePoolLabelKey, evictionActionNames)
+		},
+	})
+	return err
+}
+
 // New returns a Cache implementation.
 func New(schedulerCacheParams *SchedulerCacheParams) (Cache, error) {
 	return newSchedulerCache(schedulerCacheParams)
@@ -134,6 +175,7 @@ type SchedulerCacheParams struct {
 	UpdatePodEvictionCondition  bool
 	StuckInReleasingThreshold   time.Duration
 	DiscoveryClient             discovery.DiscoveryInterface
+	EvictionActionNames         []string
 }
 
 type SchedulerCache struct {
@@ -199,6 +241,18 @@ func newSchedulerCache(schedulerCacheParams *SchedulerCacheParams) (*SchedulerCa
 		return nil, fmt.Errorf("failed to set scheduler pod transform: %w", err)
 	}
 	sc.kubeAiSchedulerInformerFactory = kubeaischedulerinfo.NewSharedInformerFactory(sc.kubeAiSchedulerClient, 0)
+	partitionSelector, err := sc.schedulingNodePoolParams.GetLabelSelector()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create scheduling partition selector: %w", err)
+	}
+	if err := registerPodGroupEvictionMetricHandlers(
+		sc.kubeAiSchedulerInformerFactory.Scheduling().V2alpha2().PodGroups().Informer(),
+		partitionSelector,
+		sc.schedulingNodePoolParams.NodePoolLabelKey,
+		schedulerCacheParams.EvictionActionNames,
+	); err != nil {
+		return nil, fmt.Errorf("failed to register PodGroup eviction metric handlers: %w", err)
+	}
 
 	if err := featuregates.SetDRAFeatureGate(schedulerCacheParams.DiscoveryClient); err != nil {
 		return nil, fmt.Errorf("failed to determine dynamic resource allocation availability: %w", err)
@@ -295,12 +349,20 @@ func (sc *SchedulerCache) Evict(evictedPod *v1.Pod, evictedPodGroup *podgroup_in
 	return nil
 }
 
+func (sc *SchedulerCache) RecordPodGroupEvictionEvent(podGroup *podgroup_info.PodGroupInfo, action string) {
+	nodepool := utils.GetNodePoolNameFromLabels(
+		podGroup.PodGroup.Labels,
+		sc.schedulingNodePoolParams.NodePoolLabelKey,
+	)
+	metrics.IncPodGroupEvictionEvents(podGroup.PodGroup, nodepool, action)
+}
+
 func (sc *SchedulerCache) evict(evictedPod *v1.Pod, evictedPodGroup *enginev2alpha2.PodGroup, evictionMetadata eviction_info.EvictionMetadata, message string) {
 	sc.workersWaitGroup.Add(1)
 	go func() {
 		defer sc.workersWaitGroup.Done()
 		if len(message) > 0 {
-			sc.StatusUpdater.Evicted(evictedPodGroup, evictionMetadata, message)
+			sc.StatusUpdater.Evicted(evictedPod, evictedPodGroup, evictionMetadata, message)
 		}
 
 		log.InfraLogger.V(6).Do(func() {
